@@ -1,0 +1,6 @@
+torch>=2.0.0
+torchvision>=0.15.0
+mmengine>=0.10.0
+mmcv>=2.0.0
+mmdet>=3.0.0
+opencv-python>=4.5.0
