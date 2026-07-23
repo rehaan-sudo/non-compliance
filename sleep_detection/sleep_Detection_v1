@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""
+sleep_detection.py — Factory Floor Worker Sleep / Prolonged-Inactivity Detection
+================================================================================
+MVP single-file pipeline:
+  1. RTMDet-Tiny  →  detect person bounding boxes
+  2. Centroid-distance tracker  →  assign persistent person_id across frames
+  3. Stillness check  →  centroid movement < MOVEMENT_EPSILON_PX accumulates stillness_duration
+  4. RTMPose-S (top-down)  →  run pose estimation on STILL_CANDIDATE person crops
+  5. Posture check  →  head-down angle & torso angle vs vertical
+  6. State machine  →  NORMAL → STILL_CANDIDATE → POSTURE_CONFIRMED → COOLDOWN → NORMAL
+  7. Annotated MP4 output + console logging + sleep_events.log
+
+Tunable constants are at the top of this file (search "CONSTANTS").
+"""
+
+import os
+import sys
+import time
+import urllib.request
+from datetime import datetime
+from collections import defaultdict
+
+import cv2
+import numpy as np
+import torch
+
+# ── PyTorch 2.6+ compatibility: allow legacy checkpoint objects ──────────
+_orig_torch_load = torch.load
+torch.load = lambda *a, **kw: _orig_torch_load(
+    *a, **{**kw, "weights_only": kw.get("weights_only", False)}
+)
+
+# ── mmdet (person detection) ────────────────────────────────────────────
+from mmdet.apis import init_detector, inference_detector
+
+# ── mmpose (pose estimation) ────────────────────────────────────────────
+from mmpose.apis import init_model as init_pose_model
+from mmpose.apis import inference_topdown
+from mmpose.utils import register_all_modules
+
+# ── mmengine registry scope management ──────────────────────────────────
+from mmengine.registry import DefaultScope
+
+
+# =============================================================================
+# CONSTANTS  —  tune these values to match your scene
+# =============================================================================
+
+# --- Paths ----------------------------------------------------------------
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(HERE)  # non-compliance/
+
+# Person-detection model (RTMDet-Tiny, COCO pretrained)
+DETECTOR_CONFIG = os.path.join(
+    PROJECT_ROOT, "person_Detection_v1", "rtmdet_tiny_8xb32-300e_coco.py"
+)
+DETECTOR_CHECKPOINT = os.path.join(
+    PROJECT_ROOT, "person_Detection_v1",
+    "rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth"
+)
+
+# Pose-estimation model (RTMPose-S, COCO 17-keypoint, 256×192)
+# Config will be auto-downloaded; checkpoint will be auto-downloaded.
+POSE_MODEL_NAME = "rtmpose-s_8xb256-420e_coco-256x192"
+POSE_CONFIG = os.path.join(HERE, "rtmpose-s_8xb256-420e_coco-256x192.py")
+POSE_CHECKPOINT = os.path.join(
+    HERE, "rtmpose-s_simcc-coco_pt-aic-coco_420e-256x192-8edcf0d7_20230127.pth"
+)
+
+# Input / output
+VIDEO_PATH = os.path.join(HERE, "video", "sleep_v2.mp4")
+OUTPUT_VIDEO = os.path.join(HERE, "output", "annotated_output.mp4")
+LOG_FILE = os.path.join(HERE, "logs", "sleep_events.log")
+
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# --- Detection -------------------------------------
+PERSON_CLASS_ID = 0           # COCO class index for "person"
+CONF_THRESHOLD = 0.15 #0.3          # minimum detection confidence
+
+# --- Simple centroid tracker --------------------------
+MATCH_DISTANCE_PX = 80        # max L2 distance to match a detection to existing track
+# MAX_MISSING_FRAMES is now computed dynamically as int(fps_video * 8) in main()
+
+# --- Stillness detection --------------------------------------------------
+MOVEMENT_EPSILON_PX = 25      # max distance from anchor_centroid → "still" (was 15)
+MOVEMENT_RESET_CONFIRM_FRAMES = 6   # consecutive frames exceeding epsilon before anchor reset
+STILLNESS_THRESHOLD_SEC = 2 # must be still this long to become STILL_CANDIDATE
+
+# --- Track re-acquisition -------------------------------------------------
+REACQUIRE_DISTANCE_PX = 100   # max distance to re-acquire a recently-lost track
+LOST_TRACK_EXPIRY_SEC = 5.0   # forget lost-track state after this many seconds
+
+# --- Posture thresholds (degrees from vertical) ---------------------------
+HEAD_DOWN_ANGLE_THRESHOLD = 45   # neck→nose vector angle  > this → head-down
+LYING_ANGLE_THRESHOLD = 60       # shoulder→hip vector angle > this → lying down
+POSTURE_CONFIRM_SEC = 2        # bad posture must persist this long to confirm
+POSE_MIN_KEYPOINT_CONF = 0.25    # ignore keypoints below this confidence
+
+# --- Cooldown -------------------------------------------------------------
+COOLDOWN_SECONDS = 180           # ignore a confirmed person for this long
+
+# --- Output / display -----------------------------------------------------
+SHOW_DISPLAY = False             # set True to preview in a window while processing
+
+# =============================================================================
+# End of CONSTANTS
+# =============================================================================
+
+KP = {
+    "nose": 0,
+    "left_eye": 1,   "right_eye": 2,
+    "left_ear": 3,   "right_ear": 4,
+    "left_shoulder": 5,  "right_shoulder": 6,
+    "left_elbow": 7,     "right_elbow": 8,
+    "left_wrist": 9,     "right_wrist": 10,
+    "left_hip": 11,      "right_hip": 12,
+    "left_knee": 13,     "right_knee": 14,
+    "left_ankle": 15,    "right_ankle": 16,
+}
+
+# Skeleton edges for drawing (COCO format)
+SKELETON_EDGES = [
+    (0, 1), (0, 2), (1, 3), (2, 4),          # head
+    (5, 6),                                   # shoulders
+    (5, 7), (7, 9), (6, 8), (8, 10),         # arms
+    (5, 11), (6, 12), (11, 12),               # torso
+    (11, 13), (13, 15), (12, 14), (14, 16),   # legs
+]
+
+# State machine states
+STATE_NORMAL = "NORMAL"
+STATE_STILL_CANDIDATE = "STILL_CANDIDATE"
+STATE_POSTURE_CONFIRMED = "POSTURE_CONFIRMED"
+STATE_COOLDOWN = "COOLDOWN"
+
+# Colours per state (BGR)
+STATE_COLORS = {
+    STATE_NORMAL: (0, 255, 0),            # green
+    STATE_STILL_CANDIDATE: (0, 200, 255), # yellow-orange
+    STATE_POSTURE_CONFIRMED: (0, 0, 255), # red
+    STATE_COOLDOWN: (255, 0, 255),        # magenta
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Utility helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ensure_dirs():
+    """Create output/, logs/, video/ if they don't exist."""
+    for d in [os.path.join(HERE, "output"),
+              os.path.join(HERE, "logs"),
+              os.path.join(HERE, "video")]:
+        os.makedirs(d, exist_ok=True)
+
+
+def download_file(url: str, dest: str, desc: str = "") -> bool:
+    """Download *url* → *dest*.  Returns True on success."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.isfile(dest):
+        print(f"  [{desc}] already exists: {dest}")
+        return True
+    print(f"  [{desc}] downloading → {dest}  …", end=" ", flush=True)
+    try:
+        urllib.request.urlretrieve(url, dest)
+        print("done.")
+        return True
+    except Exception as e:
+        print(f"FAILED ({e})")
+        if os.path.isfile(dest):
+            os.remove(dest)
+        return False
+
+
+def ensure_pose_model():
+    """Download RTMPose-S config & checkpoint if missing.
+
+    Uses mim (installed with openmim) for reliable model downloading.
+    """
+    # We need to be able to reassign POSE_CHECKPOINT in case mim uses
+    # a different filename than our hardcoded default.
+    global POSE_CHECKPOINT
+
+    need_cfg = not os.path.isfile(POSE_CONFIG)
+    need_ckpt = not os.path.isfile(POSE_CHECKPOINT)
+
+    if not need_cfg and not need_ckpt:
+        print("[INFO] RTMPose-S model files already present.")
+        return
+
+    # ── Try mim download (handles URLs / filenames correctly) ──────
+    import subprocess
+    print("[INFO] Downloading RTMPose-S model via mim ...")
+    result = subprocess.run(
+        ["mim", "download", "mmpose",
+         "--config", "rtmpose-s_8xb256-420e_coco-256x192",
+         "--dest", HERE],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("[INFO] mim download succeeded.")
+        # mim may name the checkpoint differently; find the actual .pth
+        for f in os.listdir(HERE):
+            if f.startswith("rtmpose-s_simcc") and f.endswith(".pth"):
+                actual = os.path.join(HERE, f)
+                if actual != POSE_CHECKPOINT:
+                    print(f"[INFO] Using checkpoint: {f}")
+                    POSE_CHECKPOINT = actual
+                break
+    else:
+        print(f"[WARN] mim download failed:\n{result.stderr}")
+        # ── Fallback: direct URL download ──────────────────────────
+        config_url = (
+            "https://raw.githubusercontent.com/open-mmlab/mmpose/main/"
+            "configs/body_2d_keypoint/rtmpose/coco/"
+            "rtmpose-s_8xb256-420e_coco-256x192.py"
+        )
+        ckpt_url = (
+            "https://download.openmmlab.com/mmpose/v1/projects/rtmpose/"
+            "rtmpose-s_simcc-coco_pt-aic-coco_420e-256x192-8edcf0d7_20230127.pth"
+        )
+        ok_cfg = download_file(config_url, POSE_CONFIG, "pose config")
+        ok_ckpt = download_file(ckpt_url, POSE_CHECKPOINT, "pose checkpoint")
+
+        if not ok_cfg or not ok_ckpt:
+            print("\n[ERROR] Could not download RTMPose model automatically.")
+            print(f"  Manual:  mim download mmpose --config "
+                  f"rtmpose-s_8xb256-420e_coco-256x192 --dest {HERE}")
+            sys.exit(1)
+
+
+def angle_from_vertical(dx: float, dy: float) -> float:
+    """Angle (degrees) between vector (dx,dy) and the upward vertical (0,-1).
+
+    In image coords Y grows downward, so vertical-up is (0, -1).
+    Returns 0° = perfectly upright, 90° = horizontal, 180° = upside-down.
+    """
+    length = np.hypot(dx, dy)
+    if length < 1e-6:
+        return 0.0
+    cos_ang = -dy / length          # dot((dx,dy), (0,-1))
+    cos_ang = np.clip(cos_ang, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_ang)))
+
+
+def midpoint(p1, p2):
+    """Return (x, y) midpoint of two 2D points."""
+    return ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+
+
+def log_event(message: str):
+    """Append a timestamped line to LOG_FILE and print it."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {message}"
+    print(line)
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+        f.flush()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Person tracker  (simple centroid-distance matching, no Kalman / DeepSORT)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_next_person_id = 0      # global auto-increment
+
+def new_person_id():
+    global _next_person_id
+    pid = _next_person_id
+    _next_person_id += 1
+    return pid
+
+
+class TrackedPerson:
+    """Per-person state that persists across frames."""
+    __slots__ = (
+        "person_id", "bbox", "centroid", "last_centroid",
+        "stillness_duration", "state", "posture_bad_frames",
+        "cooldown_remaining", "missing_frames", "keypoints",
+        "head_angle", "torso_angle",
+        "anchor_centroid", "anchor_set_time", "movement_reset_counter",
+    )
+
+    def __init__(self, person_id: int, bbox, centroid):
+        self.person_id = person_id
+        self.bbox = bbox                # (x1, y1, x2, y2) ints
+        self.centroid = centroid        # (cx, cy) float
+        self.last_centroid = centroid   # previous-frame centroid (kept for legacy)
+        self.stillness_duration = 0.0   # accumulated seconds of stillness
+        self.state = STATE_NORMAL
+        self.posture_bad_frames = 0     # consecutive frames with bad posture
+        self.cooldown_remaining = 0.0   # seconds left in cooldown
+        self.missing_frames = 0         # frames since last matched
+        self.keypoints = None           # latest (17,2) array or None
+        self.head_angle = 0.0
+        self.torso_angle = 0.0
+        # ── Anchor-point stillness fields ───────────────────────────
+        self.anchor_centroid = None     # (cx, cy) set when first stillness observed
+        self.anchor_set_time = 0.0      # timestamp when anchor was set
+        self.movement_reset_counter = 0 # consecutive frames above epsilon before reset
+
+
+def match_detections_to_tracks(det_centroids, tracked, match_dist):
+    """Greedy nearest-neighbour matching.
+
+    Returns:
+        matches:  list of (tracked_person, det_idx) tuples
+        unmatched_dets:  set of detection indices not matched
+    """
+    if not tracked or not det_centroids:
+        return [], set(range(len(det_centroids)))
+
+    # Build distance matrix
+    track_list = list(tracked.values())
+    used_dets = set()
+    matches = []
+
+    # For each tracked person, find the closest unmatched detection
+    for t in track_list:
+        best_idx = None
+        best_dist = float("inf")
+        for i, dc in enumerate(det_centroids):
+            if i in used_dets:
+                continue
+            d = np.hypot(t.centroid[0] - dc[0], t.centroid[1] - dc[1])
+            if d < best_dist and d < match_dist:
+                best_dist = d
+                best_idx = i
+        if best_idx is not None:
+            matches.append((t, best_idx))
+            used_dets.add(best_idx)
+
+    unmatched_dets = set(range(len(det_centroids))) - used_dets
+    return matches, unmatched_dets
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Pose-estimation helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_pose_on_persons(pose_model, frame, bboxes_xyxy):
+
+    if not bboxes_xyxy:
+        return []
+
+    # inference_topdown expects list of [[x1,y1,x2,y2], ...]
+    bbox_list = [[float(v) for v in b] for b in bboxes_xyxy]
+
+    try:
+        results = inference_topdown(pose_model, frame, bboxes=bbox_list)
+    except Exception as e:
+        print(f"  [WARN] pose inference failed: {e}")
+        return [(None, None)] * len(bboxes_xyxy)
+
+    out = []
+    for r in results:
+        try:
+            kps = r.pred_instances.keypoints  # shape (N, 17, 2)
+            scores = r.pred_instances.keypoint_scores  # shape (N, 17)
+            if kps is not None and len(kps) > 0:
+                out.append((kps[0].cpu().numpy(), scores[0].cpu().numpy()))
+            else:
+                out.append((None, None))
+        except Exception:
+            out.append((None, None))
+    return out
+
+
+def compute_posture_angles(keypoints, scores):
+
+    if keypoints is None or scores is None:
+        return None, None
+
+    kp = keypoints  # (17, 2)
+    sc = scores     # (17,)
+
+    # Required keypoints and their minimum confidence
+    required = {
+        "nose": KP["nose"],
+        "left_shoulder": KP["left_shoulder"],
+        "right_shoulder": KP["right_shoulder"],
+        "left_hip": KP["left_hip"],
+        "right_hip": KP["right_hip"],
+    }
+    for name, idx in required.items():
+        if sc[idx] < POSE_MIN_KEYPOINT_CONF:
+            return None, None
+
+    # Neck ≈ midpoint of left & right shoulders
+    neck = midpoint(kp[KP["left_shoulder"]], kp[KP["right_shoulder"]])
+    # Hip centre ≈ midpoint of left & right hips
+    hip_centre = midpoint(kp[KP["left_hip"]], kp[KP["right_hip"]])
+    # Nose
+    nose = kp[KP["nose"]]
+
+    # Head vector: neck → nose
+    head_dx = nose[0] - neck[0]
+    head_dy = nose[1] - neck[1]
+    head_angle = angle_from_vertical(head_dx, head_dy)
+
+    # Torso vector: neck → hip_centre
+    torso_dx = hip_centre[0] - neck[0]
+    torso_dy = hip_centre[1] - neck[1]
+    torso_angle = angle_from_vertical(torso_dx, torso_dy)
+
+    return head_angle, torso_angle
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  State-machine transitions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def update_state(tp: TrackedPerson, fps: float):
+
+    pid = tp.person_id
+
+    # ── COOLDOWN ──────────────────────────────────────────────────────
+    if tp.state == STATE_COOLDOWN:
+        tp.cooldown_remaining -= 1.0 / fps
+        if tp.cooldown_remaining <= 0:
+            tp.state = STATE_NORMAL
+            tp.cooldown_remaining = 0.0
+            tp.stillness_duration = 0.0
+            tp.posture_bad_frames = 0
+            print(f"  [STATE] person_id={pid}: COOLDOWN → NORMAL")
+        return  # cooldown blocks all other transitions
+
+    # ── NORMAL → STILL_CANDIDATE ──────────────────────────────────────
+    if tp.state == STATE_NORMAL:
+        if tp.stillness_duration >= STILLNESS_THRESHOLD_SEC:
+            tp.state = STATE_STILL_CANDIDATE
+            tp.posture_bad_frames = 0
+            print(f"  [STATE] person_id={pid}: NORMAL → STILL_CANDIDATE "
+                  f"(stillness={tp.stillness_duration:.1f}s)")
+        return
+
+    # ── STILL_CANDIDATE → NORMAL (moved before posture confirmed) ────
+    if tp.state == STATE_STILL_CANDIDATE:
+        if tp.stillness_duration <= 0:  # was reset because movement detected
+            tp.state = STATE_NORMAL
+            tp.posture_bad_frames = 0
+            print(f"  [STATE] person_id={pid}: STILL_CANDIDATE → NORMAL (moved)")
+            return
+
+        # Check posture
+        posture_bad = (
+            tp.head_angle > HEAD_DOWN_ANGLE_THRESHOLD or
+            tp.torso_angle > LYING_ANGLE_THRESHOLD
+        )
+
+        if posture_bad and tp.head_angle > 0:  # valid keypoints available
+            tp.posture_bad_frames += 1
+        else:
+            tp.posture_bad_frames = max(0, tp.posture_bad_frames - 1)
+
+        posture_bad_sec = tp.posture_bad_frames / fps
+        if posture_bad_sec >= POSTURE_CONFIRM_SEC:
+            # ── CONFIRMED ──────────────────────────────────────────
+            alert_msg = (
+                f"ALERT: possible sleeping worker detected "
+                f"(person_id={pid}, stillness={tp.stillness_duration:.1f}s, "
+                f"head_angle={tp.head_angle:.1f}°, "
+                f"torso_angle={tp.torso_angle:.1f}°)"
+            )
+            print(f"\n{'='*70}\n{alert_msg}\n{'='*70}\n")
+            log_event(alert_msg)
+
+            tp.state = STATE_POSTURE_CONFIRMED
+            # Immediately trigger cooldown
+            tp.state = STATE_COOLDOWN
+            tp.cooldown_remaining = COOLDOWN_SECONDS
+            print(f"  [STATE] person_id={pid}: POSTURE_CONFIRMED → COOLDOWN "
+                  f"({COOLDOWN_SECONDS}s)")
+        return
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Drawing helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def draw_skeleton(frame, keypoints, scores, color=(0, 255, 255), thickness=2):
+    """Draw COCO-17 skeleton on *frame* (mutated in-place)."""
+    if keypoints is None:
+        return
+    kp = keypoints
+    sc = scores
+    h, w = frame.shape[:2]
+
+    # Draw edges
+    for (i, j) in SKELETON_EDGES:
+        if sc[i] < POSE_MIN_KEYPOINT_CONF or sc[j] < POSE_MIN_KEYPOINT_CONF:
+            continue
+        pt1 = (int(kp[i][0]), int(kp[i][1]))
+        pt2 = (int(kp[j][0]), int(kp[j][1]))
+        if 0 <= pt1[0] < w and 0 <= pt1[1] < h and 0 <= pt2[0] < w and 0 <= pt2[1] < h:
+            cv2.line(frame, pt1, pt2, color, thickness)
+
+    # Draw keypoints
+    for i in range(len(kp)):
+        if sc[i] < POSE_MIN_KEYPOINT_CONF:
+            continue
+        x, y = int(kp[i][0]), int(kp[i][1])
+        if 0 <= x < w and 0 <= y < h:
+            cv2.circle(frame, (x, y), 3, color, -1)
+
+
+def draw_overlay(frame, tp: TrackedPerson):
+    """Draw bbox, state label, stillness counter, and skeleton on frame."""
+    x1, y1, x2, y2 = tp.bbox
+    color = STATE_COLORS.get(tp.state, (255, 255, 255))
+
+    # Bounding box
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    # State label above bbox
+    label = f"ID:{tp.person_id} [{tp.state}]"
+    cv2.putText(frame, label, (x1, max(y1 - 10, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    # Stillness counter below state label
+    if tp.state in (STATE_STILL_CANDIDATE, STATE_POSTURE_CONFIRMED):
+        dur_text = f"still:{tp.stillness_duration:.0f}s"
+        cv2.putText(frame, dur_text, (x1, max(y1 - 28, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
+
+    # Posture angles (if available)
+    if tp.head_angle > 0 or tp.torso_angle > 0:
+        angle_text = f"H:{tp.head_angle:.0f}° T:{tp.torso_angle:.0f}°"
+        cv2.putText(frame, angle_text, (x1, y2 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+    # Skeleton — only draw when actively monitoring posture
+    if tp.state in (STATE_STILL_CANDIDATE, STATE_POSTURE_CONFIRMED):
+        draw_skeleton(frame, tp.keypoints, np.ones(17), color=color)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main processing loop
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    ensure_dirs()
+
+    # ── Sanity-checks ──────────────────────────────────────────────────
+    for path, desc in [
+        (DETECTOR_CONFIG, "RTMDet config"),
+        (DETECTOR_CHECKPOINT, "RTMDet checkpoint"),
+    ]:
+        if not os.path.isfile(path):
+            sys.exit(f"[ERROR] {desc} not found: {path}")
+
+    if not os.path.isfile(VIDEO_PATH):
+        sys.exit(
+            f"[ERROR] Test video not found: {VIDEO_PATH}\n"
+            f"  Please place a test video at that path, or edit VIDEO_PATH "
+            f"at the top of this script."
+        )
+
+    # ── Ensure RTMPose model is downloaded ─────────────────────────────
+    ensure_pose_model()
+
+    if DEVICE.startswith("cuda") and not torch.cuda.is_available():
+        print("[WARN] CUDA not available — falling back to CPU.")
+        device = "cpu"
+    else:
+        device = DEVICE
+
+    # ── Load models ────────────────────────────────────────────────────
+    print(f"[INFO] Loading RTMDet-Tiny person detector on {device} ...")
+    detector = init_detector(DETECTOR_CONFIG, DETECTOR_CHECKPOINT, device=device)
+    print("[INFO] RTMDet-Tiny loaded.")
+
+    # ── Load RTMPose (must switch scope temporarily) ───────────────────
+    print(f"[INFO] Loading RTMPose-S pose estimator on {device} ...")
+    DefaultScope.get_instance("pose_scope", scope_name="mmpose")
+    register_all_modules()
+    pose_model = init_pose_model(POSE_CONFIG, POSE_CHECKPOINT, device=device)
+    print("[INFO] RTMPose-S loaded.")
+
+    # ── Open video ─────────────────────────────────────────────────────
+    print(f"[INFO] Opening video: {VIDEO_PATH}")
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        sys.exit(f"[ERROR] Cannot open video: {VIDEO_PATH}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_video = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if fps_video <= 0:
+        fps_video = 25.0  # fallback
+        print(f"[WARN] Could not read FPS from video, assuming {fps_video}")
+
+    print(f"[INFO] {width}x{height}, {total_frames} frames, {fps_video:.1f} FPS")
+
+    # ── Dynamic MAX_MISSING_FRAMES based on FPS (≈8 seconds) ──────────
+    MAX_MISSING_FRAMES = int(fps_video * 8)
+    print(f"[INFO] MAX_MISSING_FRAMES={MAX_MISSING_FRAMES} "
+          f"(≈{MAX_MISSING_FRAMES/fps_video:.1f}s of missed detections)")
+
+    # ── Output video writer ────────────────────────────────────────────
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out_writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps_video, (width, height))
+    if not out_writer.isOpened():
+        sys.exit(f"[ERROR] Cannot create output video: {OUTPUT_VIDEO}")
+    print(f"[INFO] Writing annotated output → {OUTPUT_VIDEO}")
+
+    if SHOW_DISPLAY:
+        cv2.namedWindow("Sleep Detection", cv2.WINDOW_NORMAL)
+
+    # ── Tracker state ──────────────────────────────────────────────────
+    tracked: dict[int, TrackedPerson] = {}  # person_id → TrackedPerson
+
+    # Recently-lost tracks buffer (for re-acquisition within short time window)
+    # Structure: {person_id: (last_centroid, stillness_duration, anchor_centroid,
+    #                         anchor_set_time, movement_reset_counter, lost_time_sec,
+    #                         state, posture_bad_frames)}
+    recently_lost_tracks: dict[int, tuple] = {}
+
+    # Stillness milestone tracking for debug output
+    _stillness_milestones: dict[int, set] = {}  # person_id → set of % milestones reached
+
+    frame_idx = 0
+    tick_start = time.time()
+
+    # ── FRAME LOOP ─────────────────────────────────────────────────────
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
+        frame_ts = frame_idx / fps_video  # approximate timestamp from frame count
+
+        # ── 1. Person detection ────────────────────────────────────
+        with DefaultScope.overwrite_default_scope("mmdet"):
+            det_result = inference_detector(detector, frame)
+        preds = det_result.pred_instances
+        bboxes_tensor = preds.bboxes
+        scores_tensor = preds.scores
+        labels_tensor = preds.labels
+
+        # Filter: only "person" class, above confidence threshold
+        person_bboxes = []
+        for bbox, score, label in zip(bboxes_tensor, scores_tensor, labels_tensor):
+            if int(label) == PERSON_CLASS_ID and float(score) >= CONF_THRESHOLD:
+                x1, y1, x2, y2 = map(int, bbox)
+                person_bboxes.append([x1, y1, x2, y2])
+
+        # Compute centroids
+        det_centroids = [
+            ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+            for b in person_bboxes
+        ]
+
+        # ── 2. Match detections to existing tracks ──────────────────
+        matches, unmatched_dets = match_detections_to_tracks(
+            det_centroids, tracked, MATCH_DISTANCE_PX
+        )
+
+        # Update matched tracks
+        for tp, det_idx in matches:
+            bbox = person_bboxes[det_idx]
+            centroid = det_centroids[det_idx]
+
+            tp.last_centroid = tp.centroid
+            tp.centroid = centroid
+            tp.bbox = bbox
+            tp.missing_frames = 0
+
+            # ── Anchor-point stillness tracking ─────────────────────
+            if tp.state != STATE_COOLDOWN:
+                current_time = frame_ts
+
+                if tp.anchor_centroid is None:
+                    # No anchor set yet — compute movement from last centroid
+                    movement = np.hypot(
+                        centroid[0] - tp.last_centroid[0],
+                        centroid[1] - tp.last_centroid[1]
+                    )
+                    if movement <= MOVEMENT_EPSILON_PX:
+                        # First stillness observed — set anchor
+                        tp.anchor_centroid = centroid
+                        tp.anchor_set_time = current_time
+                        tp.stillness_duration = 0.0
+                        tp.movement_reset_counter = 0
+                else:
+                    # Anchor exists — compare current centroid to anchor
+                    dist_from_anchor = np.hypot(
+                        centroid[0] - tp.anchor_centroid[0],
+                        centroid[1] - tp.anchor_centroid[1]
+                    )
+
+                    if dist_from_anchor <= MOVEMENT_EPSILON_PX:
+                        # Still close to anchor — accumulate stillness
+                        tp.stillness_duration = current_time - tp.anchor_set_time
+                        tp.movement_reset_counter = 0
+                    else:
+                        # Deviated from anchor — count consecutive bad frames
+                        tp.movement_reset_counter += 1
+                        if tp.movement_reset_counter >= MOVEMENT_RESET_CONFIRM_FRAMES:
+                            # Sustained deviation: reset the anchor
+                            prev_stillness = tp.stillness_duration
+                            tp.anchor_centroid = centroid
+                            tp.anchor_set_time = current_time
+                            tp.stillness_duration = 0.0
+                            tp.movement_reset_counter = 0
+                            # Log the reset
+                            if tp.state == STATE_STILL_CANDIDATE:
+                                tp.state = STATE_NORMAL
+                                tp.posture_bad_frames = 0
+                                print(f"  [RESET] pid={tp.person_id}: "
+                                      f"STILL_CANDIDATE→NORMAL (anchor reset, "
+                                      f"dist={dist_from_anchor:.1f}px, "
+                                      f"prev_stillness={prev_stillness:.1f}s)")
+                            else:
+                                print(f"  [RESET] pid={tp.person_id}: "
+                                      f"anchor reset (NORMAL, "
+                                      f"dist={dist_from_anchor:.1f}px, "
+                                      f"prev_stillness={prev_stillness:.1f}s)")
+            else:
+                # Cooldown: reset anchor so it's fresh next time
+                tp.anchor_centroid = None
+                tp.anchor_set_time = 0.0
+                tp.movement_reset_counter = 0
+
+        # ── Attempt re-acquisition for unmatched detections ──────────
+        still_unmatched = set()
+        for det_idx in unmatched_dets:
+            bbox = person_bboxes[det_idx]
+            centroid = det_centroids[det_idx]
+            reacquired = False
+
+            # Check against recently-lost tracks
+            expired_keys = []
+            for lost_pid, (
+                lc, ldur, lanchor, lanchor_time, lreset_cnt, lost_time,
+                lstate, lposture_bad
+            ) in list(recently_lost_tracks.items()):
+                # Expire old entries
+                if frame_ts - lost_time > LOST_TRACK_EXPIRY_SEC:
+                    expired_keys.append(lost_pid)
+                    continue
+                # Check distance
+                dist = np.hypot(centroid[0] - lc[0], centroid[1] - lc[1])
+                if dist <= REACQUIRE_DISTANCE_PX:
+                    # Re-acquire!
+                    print(f"  [TRACK] Re-acquired person_id={lost_pid} at frame {frame_idx} "
+                          f"(dist={dist:.1f}px, restored stillness={ldur:.1f}s, "
+                          f"state={lstate})")
+                    tp = TrackedPerson(lost_pid, bbox, centroid)
+                    # Restore accumulated stillness and state
+                    tp.stillness_duration = ldur
+                    tp.state = lstate
+                    tp.posture_bad_frames = lposture_bad
+                    # Back-date anchor_set_time so stillness accumulates from saved value
+                    tp.anchor_centroid = centroid
+                    tp.anchor_set_time = frame_ts - ldur if ldur > 0 else frame_ts
+                    tp.movement_reset_counter = lreset_cnt
+                    tracked[lost_pid] = tp
+                    reacquired = True
+                    expired_keys.append(lost_pid)
+                    break
+
+            for ek in expired_keys:
+                del recently_lost_tracks[ek]
+
+            if not reacquired:
+                still_unmatched.add(det_idx)
+
+        # Create new tracks for truly unmatched detections
+        for det_idx in still_unmatched:
+            bbox = person_bboxes[det_idx]
+            centroid = det_centroids[det_idx]
+            pid = new_person_id()
+            tracked[pid] = TrackedPerson(pid, bbox, centroid)
+            print(f"  [TRACK] New person_id={pid} at frame {frame_idx}")
+
+        # ── Handle missing tracks ─────────────────────────────────────
+        to_remove = []
+        for pid, tp in list(tracked.items()):
+            if pid not in {m[0].person_id for m in matches}:
+                tp.missing_frames += 1
+                if tp.missing_frames > MAX_MISSING_FRAMES:
+                    to_remove.append(pid)
+
+        for pid in to_remove:
+            tp = tracked[pid]
+            print(f"  [TRACK] Lost person_id={pid} at frame {frame_idx} "
+                  f"(stillness={tp.stillness_duration:.1f}s)")
+            # Save to recently-lost buffer before deletion
+            recently_lost_tracks[pid] = (
+                tp.centroid,
+                tp.stillness_duration,
+                tp.anchor_centroid,
+                tp.anchor_set_time,
+                tp.movement_reset_counter,
+                frame_ts,
+                tp.state,
+                tp.posture_bad_frames,
+            )
+            del tracked[pid]
+
+        # ── 3. Run pose estimation on STILL_CANDIDATE persons ────────
+        # Collect persons that need pose estimation
+        pose_candidates = [
+            tp for tp in tracked.values()
+            if tp.state in (STATE_STILL_CANDIDATE, STATE_POSTURE_CONFIRMED)
+        ]
+        if pose_candidates:
+            pose_bboxes = [tp.bbox for tp in pose_candidates]
+            pose_results = run_pose_on_persons(pose_model, frame, pose_bboxes)
+            for tp, (kps, scores) in zip(pose_candidates, pose_results):
+                if kps is not None and scores is not None:
+                    tp.keypoints = kps
+                    head_ang, torso_ang = compute_posture_angles(kps, scores)
+                    if head_ang is not None:
+                        tp.head_angle = head_ang
+                        tp.torso_angle = torso_ang
+                else:
+                    # Pose failed — reset posture counters to be safe
+                    tp.posture_bad_frames = max(0, tp.posture_bad_frames - 1)
+
+        # ── 4. State-machine updates ─────────────────────────────────
+        for tp in tracked.values():
+            update_state(tp, fps_video)
+
+        # ── 4b. Stillness milestone tracking ──────────────────────────
+        for tp in tracked.values():
+            if tp.anchor_centroid is not None and tp.stillness_duration > 0:
+                pid_ms = _stillness_milestones.setdefault(tp.person_id, set())
+                pct = int((tp.stillness_duration / STILLNESS_THRESHOLD_SEC) * 100)
+                for milestone in [10, 25, 50, 75, 90, 100]:
+                    if pct >= milestone and milestone not in pid_ms:
+                        pid_ms.add(milestone)
+                        print(f"  [MILESTONE] pid={tp.person_id} "
+                              f"stillness={tp.stillness_duration:.1f}s "
+                              f"({milestone}% of {STILLNESS_THRESHOLD_SEC}s) "
+                              f"state={tp.state} "
+                              f"anchor_set_time={tp.anchor_set_time:.1f}s")
+
+        # ── 4c. Debug: anchor-point stillness info every 30 frames ───
+        if frame_idx % 30 == 0:
+            for tp in tracked.values():
+                if tp.anchor_centroid is not None:
+                    dist = np.hypot(
+                        tp.centroid[0] - tp.anchor_centroid[0],
+                        tp.centroid[1] - tp.anchor_centroid[1]
+                    )
+                    pct = (tp.stillness_duration / STILLNESS_THRESHOLD_SEC) * 100
+                    print(f"  [DEBUG] pid={tp.person_id} state={tp.state} "
+                          f"anchor=({tp.anchor_centroid[0]:.0f},{tp.anchor_centroid[1]:.0f}) "
+                          f"cur=({tp.centroid[0]:.0f},{tp.centroid[1]:.0f}) "
+                          f"dist={dist:.1f}px "
+                          f"still={tp.stillness_duration:.1f}s/{STILLNESS_THRESHOLD_SEC}s "
+                          f"({pct:.0f}%) "
+                          f"rst_cnt={tp.movement_reset_counter}")
+
+        # ── 5. Draw overlays ─────────────────────────────────────────
+        for tp in tracked.values():
+            draw_overlay(frame, tp)
+
+        # ── 6. Global overlays ───────────────────────────────────────
+        elapsed_total = time.time() - tick_start
+        proc_fps = frame_idx / elapsed_total if elapsed_total > 0 else 0
+        cv2.putText(
+            frame, f"Frame: {frame_idx}/{total_frames}  FPS: {proc_fps:.1f}",
+            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
+        )
+
+        # Person count per state
+        state_counts = defaultdict(int)
+        for tp in tracked.values():
+            state_counts[tp.state] += 1
+        status_y = 65
+        for state in [STATE_NORMAL, STATE_STILL_CANDIDATE,
+                       STATE_POSTURE_CONFIRMED, STATE_COOLDOWN]:
+            cnt = state_counts[state]
+            if cnt > 0:
+                col = STATE_COLORS.get(state, (255, 255, 255))
+                cv2.putText(frame, f"{state}: {cnt}", (10, status_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+                status_y += 25
+
+        # ── 7. Write output frame ────────────────────────────────────
+        out_writer.write(frame)
+
+        if SHOW_DISPLAY:
+            cv2.imshow("Sleep Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("[INFO] User pressed 'q' — stopping.")
+                break
+
+        # ── 8. Console progress ──────────────────────────────────────
+        if frame_idx % 100 == 0 or frame_idx == 1:
+            n_persons = len(tracked)
+            still_candidates = state_counts[STATE_STILL_CANDIDATE]
+            confirmed = state_counts[STATE_POSTURE_CONFIRMED]
+            print(f"  [PROGRESS] frame={frame_idx}/{total_frames}  "
+                  f"persons_tracked={n_persons}  "
+                  f"still_candidates={still_candidates}  "
+                  f"confirmed={confirmed}  "
+                  f"fps={proc_fps:.1f}")
+
+    # ── Cleanup ─────────────────────────────────────────────────────────
+    cap.release()
+    out_writer.release()
+    if SHOW_DISPLAY:
+        cv2.destroyAllWindows()
+
+    total_time = time.time() - tick_start
+    print(f"\n[INFO] Done.  Processed {frame_idx} frames in {total_time:.1f}s "
+          f"({frame_idx / total_time:.1f} avg FPS)")
+    print(f"[INFO] Annotated video saved → {OUTPUT_VIDEO}")
+    print(f"[INFO] Event log saved → {LOG_FILE}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    main()
