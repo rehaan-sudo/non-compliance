@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+downtime_monitor.py — Real-Time Machine Downtime Detection from Material-Count Logs
+====================================================================================
+Tails a camera's material-count log file (tail -F style), runs a state machine
+to detect production downtime events, writes alerts to a local file, and
+persists state across restarts.
+
+State machine:
+  BASELINE_PENDING  →  RUNNING  →  LOW_STREAK  →  DOWN  →  RUNNING (loop)
+
+The `send_alert()` function is a single abstraction point — swap it for a
+Telegram sender later without touching the rest of the code.
+
+Usage:
+    python3 downtime_monitor.py --cam-id cam11 --log-file /path/to/material.log
+    python3 downtime_monitor.py --cam-id cam11 --log-file /path/to/material.log \\
+        --alert-output /path/to/alerts.log --state-file /path/to/state.json
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import signal
+import sys
+import time
+from datetime import datetime, timedelta
+from enum import Enum, auto
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Dict, Generator, Optional, Tuple
+
+# =============================================================================
+# CONFIGURABLE CONSTANTS — tune these without digging through the code
+# =============================================================================
+
+# --- State-machine thresholds -----------------------------------------------
+GOOD_THRESHOLD = 3             # MATERIAL >= this counts as a "good/running" cycle
+BASELINE_CONSECUTIVE = 1       # number of consecutive good cycles to establish baseline
+DOWNTIME_WINDOW_MINUTES = 10   # low-material streak must persist this long to trigger DOWN
+
+# --- Hardcoded runtime defaults (edit for quick local runs) -----------------
+# Set these so you can run just:  python3 downtime_monitor.py
+# CLI arguments override these if passed.
+HARDCODED_CAM_ID = "cam11"
+HARDCODED_LOG_FILE = "/home/ekak-11/Desktop/kp_model/non-compliance/downtime_v3/test_cam11.log"
+
+# --- Tail-follow settings ---------------------------------------------------
+TAIL_SLEEP_SECONDS = 0.5       # sleep between polls when no new data
+TAIL_READ_CHUNK_BYTES = 4096   # max bytes to read per poll
+
+# --- Operational log rotation -----------------------------------------------
+OP_LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB
+OP_LOG_BACKUP_COUNT = 3
+
+# --- Log format (used for both console and op-log file) ---------------------
+LOG_FORMAT_STR = "%(asctime)s | %(levelname)-7s | %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# =============================================================================
+# END OF CONFIGURABLE CONSTANTS
+# =============================================================================
+
+
+# ── Regex for parsing material-count log lines ─────────────────────────────
+# Matches lines like:
+#   2026-07-16 00:23:16 | VIDEO_ID=1744178833 | TIMESTAMP=2026-07-15 10:30:05 | MATERIAL=10 | ...
+LOG_LINE_RE = re.compile(
+    r"TIMESTAMP=(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
+    r".*?MATERIAL=(?P<mat>\d+)"
+)
+
+# Timestamp format used in the log file's TIMESTAMP field
+TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+# ── State enumeration ──────────────────────────────────────────────────────
+
+
+class State(Enum):
+    BASELINE_PENDING = auto()  # waiting for 3 consecutive good cycles
+    RUNNING = auto()           # production is running normally
+    LOW_STREAK = auto()        # material dropped below threshold; accumulating
+    DOWN = auto()              # confirmed downtime (streak >= window)
+
+
+# ── State-context keys ────────────────────────────────────────────────────
+#   state: State                  — current state
+#   baseline_good_count: int     — consecutive good cycles seen in BASELINE_PENDING
+#   low_streak_start: datetime   — TIMESTAMP of first low-material log in this streak
+#   last_processed_ts: datetime  — most recent log TIMESTAMP processed (for resume dedup)
+
+
+# =============================================================================
+# LOG PARSING
+# =============================================================================
+
+
+def parse_line(line: str) -> Tuple[Optional[datetime], Optional[int]]:
+    """Extract TIMESTAMP and MATERIAL from a single log line.
+
+    Returns:
+        (parsed_dt, material_count) — both None if the line is malformed.
+    """
+    m = LOG_LINE_RE.search(line)
+    if not m:
+        return None, None
+
+    try:
+        parsed_dt = datetime.strptime(m.group("ts"), TS_FMT)
+    except ValueError:
+        return None, None
+
+    try:
+        material = int(m.group("mat"))
+    except ValueError:
+        return None, None
+
+    return parsed_dt, material
+
+
+# =============================================================================
+# TAIL-FOLLOW ENGINE (tail -F behaviour)
+# =============================================================================
+
+
+def tail_follow(log_path: str) -> Generator[str, None, None]:
+    """Yield new lines appended to *log_path* indefinitely.
+
+    Implements tail -F semantics:
+      - Starts at current end-of-file (skips existing content).
+      - Detects file truncation (size dropped) → seeks back to beginning.
+      - Detects log rotation (inode changed) → closes old fd and opens new path.
+      - Sleeps TAIL_SLEEP_SECONDS between empty polls.
+    """
+    path = Path(log_path)
+
+    # Wait for the file to exist (in case it hasn't been created yet)
+    while not path.exists():
+        logging.debug("Waiting for log file to appear: %s", log_path)
+        time.sleep(TAIL_SLEEP_SECONDS)
+
+    fh: Optional[Any] = None
+    current_inode: Optional[int] = None
+    last_size: int = 0
+
+    while True:
+        try:
+            # ── Open / reopen if needed ──────────────────────────────────
+            if fh is None:
+                fh = open(log_path, "r", encoding="utf-8", errors="replace")
+                current_inode = os.fstat(fh.fileno()).st_ino
+                # Seek to end to skip existing content on first open
+                fh.seek(0, os.SEEK_END)
+                last_size = fh.tell()
+                logging.info("Tailing log file: %s (starting at end, %d bytes)",
+                             log_path, last_size)
+                continue
+
+            # ── Detect rotation via inode change ─────────────────────────
+            try:
+                stat_info = os.stat(log_path)
+            except FileNotFoundError:
+                # File was deleted or moved — close and wait for it to reappear
+                logging.info("Log file disappeared: %s — waiting for it to return", log_path)
+                fh.close()
+                fh = None
+                time.sleep(TAIL_SLEEP_SECONDS)
+                continue
+
+            if stat_info.st_ino != current_inode:
+                logging.info("Log file rotated (inode changed): %s — reopening", log_path)
+                fh.close()
+                fh = None
+                continue
+
+            # ── Detect truncation ────────────────────────────────────────
+            current_pos = fh.tell()
+            if stat_info.st_size < current_pos:
+                logging.info("Log file truncated (size %d → %d) — seeking to start",
+                             current_pos, stat_info.st_size)
+                fh.seek(0, os.SEEK_SET)
+                last_size = 0
+
+            # ── Read new lines ───────────────────────────────────────────
+            line = fh.readline()
+            if line:
+                # A full line was read (ends with \n)
+                stripped = line.rstrip("\n\r")
+                if stripped:  # skip empty lines
+                    yield stripped
+            else:
+                # No complete line available — flush and sleep
+                fh.flush()
+                time.sleep(TAIL_SLEEP_SECONDS)
+
+        except (IOError, OSError) as exc:
+            logging.warning("I/O error on log file %s: %s — retrying in %.1fs",
+                            log_path, exc, TAIL_SLEEP_SECONDS)
+            if fh:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                fh = None
+            time.sleep(TAIL_SLEEP_SECONDS)
+
+
+# =============================================================================
+# STATE PERSISTENCE
+# =============================================================================
+
+
+def _state_to_dict(cam_id: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize the run-time context dict to a JSON-serialisable dict."""
+    out: Dict[str, Any] = {
+        "cam_id": cam_id,
+        "state": ctx["state"].name,
+        "baseline_good_count": ctx["baseline_good_count"],
+    }
+    if ctx["low_streak_start"] is not None:
+        out["low_streak_start"] = ctx["low_streak_start"].strftime(TS_FMT)
+    if ctx["last_processed_ts"] is not None:
+        out["last_processed_ts"] = ctx["last_processed_ts"].strftime(TS_FMT)
+    return out
+
+
+def save_state(cam_id: str, ctx: Dict[str, Any], state_path: str) -> None:
+    """Write current state to *state_path* atomically (temp + rename)."""
+    data = _state_to_dict(cam_id, ctx)
+    tmp_path = state_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, state_path)  # atomic on Linux
+    except OSError as exc:
+        logging.error("Failed to save state file %s: %s", state_path, exc)
+
+
+def load_state(state_path: str) -> Optional[Dict[str, Any]]:
+    """Load persisted state from *state_path*.  Returns None if missing or corrupt."""
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        logging.info("No valid state file found at %s (%s) — starting fresh",
+                     state_path, exc)
+        return None
+
+    # Rebuild runtime context from JSON
+    ctx: Dict[str, Any] = {
+        "state": State[data["state"]],
+        "baseline_good_count": int(data.get("baseline_good_count", 0)),
+        "low_streak_start": None,
+        "last_processed_ts": None,
+    }
+
+    ls_str = data.get("low_streak_start")
+    if ls_str:
+        try:
+            ctx["low_streak_start"] = datetime.strptime(ls_str, TS_FMT)
+        except ValueError:
+            ctx["low_streak_start"] = None
+
+    lp_str = data.get("last_processed_ts")
+    if lp_str:
+        try:
+            ctx["last_processed_ts"] = datetime.strptime(lp_str, TS_FMT)
+        except ValueError:
+            ctx["last_processed_ts"] = None
+
+    logging.info("Loaded persisted state: %s (cam=%s, baseline_count=%d, "
+                 "low_streak_start=%s, last_processed=%s)",
+                 data["state"], data.get("cam_id"),
+                 ctx["baseline_good_count"],
+                 ctx["low_streak_start"].strftime(TS_FMT) if ctx["low_streak_start"] else "None",
+                 ctx["last_processed_ts"].strftime(TS_FMT) if ctx["last_processed_ts"] else "None")
+    return ctx
+
+
+# =============================================================================
+# ALERT DISPATCH  (swap this single function for Telegram later)
+# =============================================================================
+
+
+def send_alert(event_type: str, payload: Dict[str, Any], alert_output_path: str) -> None:
+    """Dispatch a downtime alert.
+
+    Currently writes to a local alert file.  To add Telegram support later,
+    replace the body of this function (or call an additional Telegram sender
+    from here) — the rest of the code does NOT need to change.
+
+    Args:
+        event_type: "DOWNTIME_START" or "DOWNTIME_END"
+        payload: dict with keys cam_id, start, and (for END) end, duration_str
+        alert_output_path: path to the alert log file
+    """
+    now_str = datetime.now().strftime(TS_FMT)
+    cam_id = payload["cam_id"]
+    start_str = payload["start"].strftime(TS_FMT) if isinstance(payload["start"], datetime) else payload["start"]
+
+    if event_type == "DOWNTIME_START":
+        line = f"{now_str} | CAM={cam_id} | EVENT=DOWNTIME_START | START={start_str}"
+    elif event_type == "DOWNTIME_END":
+        end_dt = payload.get("end")
+        end_str = end_dt.strftime(TS_FMT) if isinstance(end_dt, datetime) else str(end_dt)
+        duration_str = payload.get("duration_str", "?")
+        line = (f"{now_str} | CAM={cam_id} | EVENT=DOWNTIME_END "
+                f"| START={start_str} | END={end_str} | DURATION={duration_str}")
+    else:
+        logging.warning("Unknown alert event_type: %s", event_type)
+        return
+
+    try:
+        with open(alert_output_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        logging.info("ALERT written → %s: %s", alert_output_path, line)
+    except OSError as exc:
+        logging.error("Failed to write alert to %s: %s", alert_output_path, exc)
+
+
+# =============================================================================
+# DURATION HELPERS
+# =============================================================================
+
+
+def _format_duration_hh_mm(delta: timedelta) -> str:
+    """Format a timedelta as e.g. '0h 35m' or '1h 5m'."""
+    total_minutes = int(delta.total_seconds() // 60)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f"{hours}h {minutes}m"
+
+
+# =============================================================================
+# STATE MACHINE
+# =============================================================================
+
+
+def new_context() -> Dict[str, Any]:
+    """Return a fresh runtime context dict."""
+    return {
+        "state": State.BASELINE_PENDING,
+        "baseline_good_count": 0,
+        "low_streak_start": None,
+        "last_processed_ts": None,
+    }
+
+
+def process_cycle(
+    ts: datetime,
+    material: int,
+    ctx: Dict[str, Any],
+    cam_id: str,
+    alert_output_path: str,
+) -> None:
+    """Run the state machine for one material-count log entry.
+
+    All state transitions are logged at INFO level to both console and the
+    operational log file.
+    """
+    state = ctx["state"]
+
+    # ── BASELINE_PENDING ──────────────────────────────────────────────────
+    if state == State.BASELINE_PENDING:
+        if material >= GOOD_THRESHOLD:
+            ctx["baseline_good_count"] += 1
+            logging.info("BASELINE_PENDING | good cycle %d/%d | ts=%s mat=%d",
+                         ctx["baseline_good_count"], BASELINE_CONSECUTIVE,
+                         ts.strftime(TS_FMT), material)
+            if ctx["baseline_good_count"] >= BASELINE_CONSECUTIVE:
+                ctx["state"] = State.RUNNING
+                logging.info("→ BASELINE_ESTABLISHED  (transition to RUNNING)")
+        else:
+            ctx["baseline_good_count"] = 0
+            logging.info("BASELINE_PENDING | below threshold → reset counter | "
+                         "ts=%s mat=%d", ts.strftime(TS_FMT), material)
+        return
+
+    # ── RUNNING ───────────────────────────────────────────────────────────
+    if state == State.RUNNING:
+        if material >= GOOD_THRESHOLD:
+            # Stay RUNNING — nothing to do
+            logging.debug("RUNNING | ts=%s mat=%d", ts.strftime(TS_FMT), material)
+            return
+        else:
+            ctx["state"] = State.LOW_STREAK
+            ctx["low_streak_start"] = ts
+            logging.info("→ LOW_STREAK_START | ts=%s mat=%d "
+                         "(material dropped below %d)",
+                         ts.strftime(TS_FMT), material, GOOD_THRESHOLD)
+            return
+
+    # ── LOW_STREAK ────────────────────────────────────────────────────────
+    if state == State.LOW_STREAK:
+        if material >= GOOD_THRESHOLD:
+            # Noise / false alarm — discard the streak, go back to RUNNING
+            elapsed = ts - ctx["low_streak_start"]
+            logging.info("→ LOW_STREAK_CANCELLED | ts=%s mat=%d "
+                         "(recovery after %s — noise / false alarm)",
+                         ts.strftime(TS_FMT), material,
+                         _format_duration_hh_mm(elapsed))
+            ctx["state"] = State.RUNNING
+            ctx["low_streak_start"] = None
+            return
+        else:
+            # Check if we've crossed the downtime window
+            elapsed = ts - ctx["low_streak_start"]
+            elapsed_min = elapsed.total_seconds() / 60.0
+            if elapsed_min >= DOWNTIME_WINDOW_MINUTES:
+                ctx["state"] = State.DOWN
+                logging.info("→ DOWNTIME_DETECTED | ts=%s mat=%d "
+                             "(streak >= %.0f min)",
+                             ts.strftime(TS_FMT), material,
+                             DOWNTIME_WINDOW_MINUTES)
+                send_alert("DOWNTIME_START", {
+                    "cam_id": cam_id,
+                    "start": ctx["low_streak_start"],
+                }, alert_output_path)
+            else:
+                logging.info("LOW_STREAK | accumulating | ts=%s mat=%d | "
+                             "elapsed=%.1f/%.0f min",
+                             ts.strftime(TS_FMT), material,
+                             elapsed_min, DOWNTIME_WINDOW_MINUTES)
+            return
+
+    # ── DOWN ──────────────────────────────────────────────────────────────
+    if state == State.DOWN:
+        if material < GOOD_THRESHOLD:
+            logging.debug("DOWN (ongoing) | ts=%s mat=%d",
+                          ts.strftime(TS_FMT), material)
+            return
+        else:
+            # Downtime ends — compute total duration
+            end_ts = ts
+            duration = end_ts - ctx["low_streak_start"]
+            duration_str = _format_duration_hh_mm(duration)
+            logging.info("→ DOWNTIME_RESUMED | ts=%s mat=%d | "
+                         "start=%s end=%s duration=%s",
+                         ts.strftime(TS_FMT), material,
+                         ctx["low_streak_start"].strftime(TS_FMT),
+                         end_ts.strftime(TS_FMT),
+                         duration_str)
+            send_alert("DOWNTIME_END", {
+                "cam_id": cam_id,
+                "start": ctx["low_streak_start"],
+                "end": end_ts,
+                "duration_str": duration_str,
+            }, alert_output_path)
+            ctx["state"] = State.RUNNING
+            ctx["low_streak_start"] = None
+            return
+
+
+# =============================================================================
+# SIGNAL HANDLING
+# =============================================================================
+
+_shutdown_requested = False
+
+
+def _signal_handler(signum: int, _frame: Any) -> None:
+    """Set a flag on SIGINT / SIGTERM so the main loop can exit cleanly."""
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name
+    logging.info("Received %s — shutting down gracefully...", sig_name)
+    _shutdown_requested = True
+
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+
+def setup_logging(op_log_path: str) -> None:
+    """Configure Python logging: console + rotating file for operational log."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # let handlers control their own levels
+
+    formatter = logging.Formatter(fmt=LOG_FORMAT_STR, datefmt=LOG_DATE_FORMAT)
+
+    # Console handler — INFO and above
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+    root_logger.addHandler(console)
+
+    # Rotating file handler — DEBUG and above (full detail for verification)
+    file_handler = RotatingFileHandler(
+        op_log_path,
+        maxBytes=OP_LOG_MAX_BYTES,
+        backupCount=OP_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+
+def main() -> None:
+    """Entry point — parse CLI, set up logging, load state, run monitor loop."""
+    # ── CLI ───────────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(
+        description="Real-time machine downtime detection from material-count logs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--cam-id", default=HARDCODED_CAM_ID,
+        help="Camera / machine identifier (default: '%(default)s' from HARDCODED_CAM_ID)",
+    )
+    parser.add_argument(
+        "--log-file", default=HARDCODED_LOG_FILE,
+        help="Path to the material-count log file to monitor (default: '%(default)s')",
+    )
+    parser.add_argument(
+        "--alert-output", default=None,
+        help="Path for downtime alert output (default: downtime_alerts_<cam_id>.log "
+             "in the script directory)",
+    )
+    parser.add_argument(
+        "--state-file", default=None,
+        help="Path for state persistence JSON (default: downtime_state_<cam_id>.json "
+             "in the script directory)",
+    )
+    parser.add_argument(
+        "--op-log", default=None,
+        help="Path for operational log (default: downtime_op_<cam_id>.log "
+             "in the script directory)",
+    )
+    args = parser.parse_args()
+
+    cam_id: str = args.cam_id
+    log_file: str = args.log_file
+
+    # Resolve default paths relative to this script's directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    alert_output = args.alert_output or os.path.join(
+        script_dir, f"downtime_alerts_{cam_id}.log"
+    )
+    state_file = args.state_file or os.path.join(
+        script_dir, f"downtime_state_{cam_id}.json"
+    )
+    op_log = args.op_log or os.path.join(
+        script_dir, f"downtime_op_{cam_id}.log"
+    )
+
+    # ── Logging ───────────────────────────────────────────────────────────
+    setup_logging(op_log)
+    logging.info("=" * 60)
+    logging.info("DOWNTIME MONITOR STARTING")
+    logging.info("  cam_id      : %s", cam_id)
+    logging.info("  log_file    : %s", log_file)
+    logging.info("  alert_output: %s", alert_output)
+    logging.info("  state_file  : %s", state_file)
+    logging.info("  op_log      : %s", op_log)
+    logging.info("  GOOD_THRESHOLD           : %d", GOOD_THRESHOLD)
+    logging.info("  BASELINE_CONSECUTIVE     : %d", BASELINE_CONSECUTIVE)
+    logging.info("  DOWNTIME_WINDOW_MINUTES  : %d", DOWNTIME_WINDOW_MINUTES)
+
+    # ── Load persisted state ──────────────────────────────────────────────
+    ctx = load_state(state_file)
+    if ctx is None:
+        ctx = new_context()
+        logging.info("Starting with fresh context (BASELINE_PENDING)")
+
+    # ── Register signal handlers for graceful shutdown ────────────────────
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # ── Main monitoring loop ──────────────────────────────────────────────
+    lines_processed = 0
+    lines_skipped = 0
+    lines_malformed = 0
+
+    try:
+        for raw_line in tail_follow(log_file):
+            if _shutdown_requested:
+                break
+
+            # Parse the line
+            ts, material = parse_line(raw_line)
+
+            if ts is None or material is None:
+                lines_malformed += 1
+                logging.warning("MALFORMED line skipped: %.100s", raw_line)
+                continue
+
+            # Skip lines already processed (resume after restart)
+            if ctx["last_processed_ts"] is not None and ts <= ctx["last_processed_ts"]:
+                lines_skipped += 1
+                logging.debug("SKIP (already processed): ts=%s", ts.strftime(TS_FMT))
+                continue
+
+            # Process through state machine
+            process_cycle(ts, material, ctx, cam_id, alert_output)
+
+            # Update last-processed timestamp
+            ctx["last_processed_ts"] = ts
+            lines_processed += 1
+
+            # Persist state
+            save_state(cam_id, ctx, state_file)
+
+    except KeyboardInterrupt:
+        logging.info("KeyboardInterrupt received — shutting down")
+    finally:
+        logging.info("Shutting down.  Processed=%d  Skipped=%d  Malformed=%d",
+                     lines_processed, lines_skipped, lines_malformed)
+        save_state(cam_id, ctx, state_file)
+        logging.info("Final state saved to %s", state_file)
+        logging.info("DOWNTIME MONITOR STOPPED")
+
+
+if __name__ == "__main__":
+    main()
